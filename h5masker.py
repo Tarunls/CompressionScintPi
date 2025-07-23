@@ -4,8 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
-import pyarrow as pa
-import pyarrow.parquet as pq
+import gc 
 
 def readv325(path):
     dt = np.dtype([
@@ -26,8 +25,7 @@ def readv325(path):
     arr = np.fromfile(path, dtype=dt)
     return pd.DataFrame.from_records(arr)
 
-# -- Reuse your readv326 logic
-def readv326(path):
+def readv326(path, offset_bytes=None, num_records=None):
     rec_dt = np.dtype([
        ('towe', np.float32), ('cons', np.uint8),
        ('sats', np.uint8), ('svid', np.uint8),
@@ -39,18 +37,33 @@ def readv326(path):
        ('rng1', np.float64), ('rng2', np.float64),
        ('lck1', np.int32), ('lck2', np.int32),
     ], align=True)
+
+    record_size = rec_dt.itemsize 
     hdr_size = 60
+    data_start_offset = 64 * 2 
+
     with open(path, 'rb') as f:
+
         buf = f.read(hdr_size)
-    fmt = '@fBbiBBBBBBddddi'
-    vals = struct.unpack(fmt, buf)
-    week = vals[-1]
-    rec = np.fromfile(path, dtype=rec_dt, offset=64*2)
+        fmt = '@fBbiBBBBBBddddi'
+        vals = struct.unpack(fmt, buf)
+        week = vals[-1]
+
+        if offset_bytes is None or num_records is None:
+
+            f.seek(data_start_offset)
+            rec = np.fromfile(f, dtype=rec_dt)
+        else:
+
+            effective_offset = data_start_offset + offset_bytes
+            f.seek(effective_offset)
+
+            rec = np.fromfile(f, dtype=rec_dt, count=num_records)
+
     df = pd.DataFrame.from_records(rec)
     df['week'] = week
-    return df
+    return df, record_size, data_start_offset 
 
-# -- Optimize numeric dtypes
 def optimize_dtypes(df):
     for col in df.columns:
         if pd.api.types.is_integer_dtype(df[col]):
@@ -60,23 +73,28 @@ def optimize_dtypes(df):
                 df[col] = df[col].astype('int8')
             elif df[col].min() >= -32768 and df[col].max() <= 32767:
                 df[col] = df[col].astype('int16')
+            elif df[col].min() >= -2147483648 and df[col].max() <= 2147483647:
+                df[col] = df[col].astype('int32')
         elif pd.api.types.is_float_dtype(df[col]) and col not in ['cph1', 'cph2', 'rng1', 'rng2']:
             df[col] = df[col].astype('float32')
     return df
 
-# -- Convert week + towe to datetime
 def add_datetime(df):
     gps_epoch = datetime(1980, 1, 6)
+
+    df['week'] = df['week'].astype(int)
     df['datetime'] = [gps_epoch + timedelta(weeks=w, seconds=t) for w, t in zip(df['week'], df['towe'])]
     return df.drop(columns=['week', 'towe'])
 
-# -- Calculate S4 index
 def compute_s4(df):
+    if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+        df['datetime'] = pd.to_datetime(df['datetime'])
+
     df['timestamp'] = df['datetime'].astype('int64') // 10**9
     df['s4_bucket'] = df['timestamp'] // 60
 
     def s4_linear(x):
-        lin = 10 ** (x / 10)  # convert dB to linear
+        lin = 10 ** (x / 10)
         return np.std(lin) / np.mean(lin) if np.mean(lin) != 0 else 0
 
     s4_vals = df.groupby(['svid', 'cons', 's4_bucket'])['snr1'].agg(s4_linear)
@@ -86,174 +104,256 @@ def compute_s4(df):
     df = df.drop(columns=['timestamp', 's4_bucket'])
     return df
 
-# -- Size helper
 def get_file_size_mb(path):
     if os.path.exists(path):
         return os.path.getsize(path) / (1024 * 1024)
     return 0
 
-# -- Plotting
-def plot_compression_ratio(unmasked_size, masked_size, slim_size, elev_masked_1min_size, no_mask_1sec_size):
+def plot_compression_ratio(unmasked_size, masked_size, slim_size, elev_masked_1min_size, no_mask_1sec_size, filename_prefix=""):
     labels = ['Unmasked', 'Masked', 'Slimmed', 'Elev Masked (1min)', 'No Mask (1sec)']
     sizes = [unmasked_size, masked_size, slim_size, elev_masked_1min_size, no_mask_1sec_size]
 
     if unmasked_size == 0:
-        print("Cannot plot compression ratios: Unmasked size is 0.")
+        print(f"Cannot plot compression ratios for {filename_prefix}: Unmasked size is 0.")
         return
 
     ratios = [(s / unmasked_size) * 100 for s in sizes]
 
     fig, ax = plt.subplots(figsize=(12, 7))
     bars = ax.bar(labels, ratios, color=['gray', 'steelblue', 'lightcoral', 'mediumseagreen', 'goldenrod'])
-    ax.set_ylabel('% of Original Unmasked Size')
-    ax.set_title('Parquet (brotli) Compression Ratio Comparison')
+    ax.set_ylabel('% of Original Processed Data Size')
+    ax.set_title(f'Parquet (brotli) Compression Ratio Comparison for {filename_prefix}')
 
     for i, bar in enumerate(bars):
         height = bar.get_height()
         ax.text(bar.get_x() + bar.get_width() / 2, height + 1,
                 f'{ratios[i]:.1f}%', ha='center', fontweight='bold')
-        ax.text(bar.get_x() + bar.get_width() / 2, -5, # Position for MB size
+        ax.text(bar.get_x() + bar.get_width() / 2, -5,
                 f'{sizes[i]:.2f} MB', ha='center', color='black', fontsize=9)
-
 
     plt.ylim(0, max(100, max(ratios) + 15))
     plt.tight_layout()
-    plt.savefig("compression_ratios_comparison.png", dpi=300)
-    plt.show()
-    print(f"\n📊 Saved graph to 'compression_ratios_comparison.png'")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_filename = os.path.join(script_dir, f"compression_ratios_{filename_prefix}.png")
+    plt.savefig(plot_filename, dpi=300)
+    plt.close(fig)
+    print(f"Saved graph to '{plot_filename}'")
 
+def process_single_v326_file(filepath, output_folder, chunk_size_records=500000):
+    """
+    Processes a single v326 .bin.zip file in chunks,
+    applies initial transformations, saves temporary parquet files,
+    then loads all temps for S4 calculation, and saves final outputs.
+    """
+    base_filename = os.path.basename(filepath).replace(".bin.zip", "")
+    print(f"\n--- Processing file: {os.path.basename(filepath)} ---")
 
-# -- Main processing (MODIFIED TO PROCESS ONLY FIRST FILE WITH PRINTS AND NEW OUTPUTS)
-def process_all_v326(folder):
-    print("📂 Current working directory:", os.getcwd())
-    print("📁 Looking inside folder:", folder)
-    print("📍 Absolute path:", os.path.abspath(folder))
+    temp_unzipped_path = None
+    intermediate_chunk_files = [] 
 
-    files = glob.glob(os.path.join(folder, "*.bin.zip"))
-    if not files:
-        print("❌ No .bin.zip files found in the folder!")
-        return
+    try:
 
-    print(f"📁 Found {len(files)} zipped v326 files")
-    big_df = []
+        with zipfile.ZipFile(filepath, 'r') as z:
+            extracted_files = z.namelist()
+            if len(extracted_files) != 1:
+                print(f"Expected 1 file inside zip, found {len(extracted_files)}. Skipping {filepath}.")
+                return
+            inner_file = extracted_files[0]
+            temp_unzipped_path = os.path.join(output_folder, f"__temp_unzipped_{base_filename}__.bin")
 
-    # Process only the first file as per the user's previous request,
-    # but the logic is set up for all if `files` wasn't sliced.
-    for i, file in enumerate(files): # Removed `[:1]` for full processing
-        print(f"\n🎯 Processing file {i+1}/{len(files)}: {os.path.basename(file)}")
+            buffer_size = 4 * 1024 
+            try:
+                with z.open(inner_file) as src: 
+                    with open(temp_unzipped_path, 'wb') as dst: 
+                        while True:
+                            data = src.read(buffer_size) 
+                            if not data:
+                                break 
+                            dst.write(data) 
+                print(f"'{inner_file}' unzipped to '{temp_unzipped_path}' by streaming.")
+            except Exception as e:
+                print(f"Error streaming unzipping '{inner_file}' from '{filepath}': {e}")
+
+                if os.path.exists(temp_unzipped_path):
+                    os.remove(temp_unzipped_path)
+                return 
+
+        dummy_df, record_size, data_start_offset = readv326(temp_unzipped_path, offset_bytes=0, num_records=1)
+        del dummy_df 
+        gc.collect()
+
+        total_file_size = os.path.getsize(temp_unzipped_path)
+        data_size_bytes = total_file_size - data_start_offset
+        total_records = data_size_bytes // record_size
+        print(f"Total data records in '{os.path.basename(temp_unzipped_path)}': {total_records}, Record size: {record_size} bytes")
+
+        print(f"Processing in chunks of {chunk_size_records} records (pre-S4 transformations)...")
+        for i in range(0, total_records, chunk_size_records):
+            current_offset_records = i
+            current_offset_bytes = current_offset_records * record_size
+            num_records_to_read = min(chunk_size_records, total_records - current_offset_records)
+
+            if num_records_to_read <= 0:
+                break 
+
+            print(f"  Reading chunk {i // chunk_size_records + 1}: Records {current_offset_records} to {current_offset_records + num_records_to_read - 1}")
+
+            chunk_df, _, _ = readv326(temp_unzipped_path, offset_bytes=current_offset_bytes, num_records=num_records_to_read)
+
+            chunk_df = optimize_dtypes(chunk_df)
+            chunk_df = add_datetime(chunk_df)
+
+            intermediate_file_name = f"__temp_{base_filename}_chunk_{i // chunk_size_records}.parquet"
+            intermediate_file_path = os.path.join(output_folder, intermediate_file_name)
+            chunk_df.to_parquet(intermediate_file_path, compression='brotli', index=False)
+            intermediate_chunk_files.append(intermediate_file_path)
+            print(f"  Saved intermediate chunk to {os.path.basename(intermediate_file_path)}")
+
+            del chunk_df 
+            gc.collect() 
+
+        print(f"All {len(intermediate_chunk_files)} intermediate chunks for '{base_filename}' saved.")
+
+        print(f"Loading all intermediate files ({len(intermediate_chunk_files)} files) for S4 computation...")
 
         try:
-            # --- Unzip ---
-            with zipfile.ZipFile(file, 'r') as z:
-                extracted = z.namelist()
-                if len(extracted) != 1:
-                    print(f"❌ Expected 1 file inside zip, found {len(extracted)}")
-                    continue
-                inner_file = extracted[0]
-                temp_path = os.path.join(folder, "__temp_unzipped__.bin")
-                with z.open(inner_file) as src, open(temp_path, 'wb') as dst:
-                    dst.write(src.read())
-            print("✅ File unzipped")
+            df_for_s4 = pd.concat([pd.read_parquet(f) for f in intermediate_chunk_files], ignore_index=True)
+            print(f"Successfully combined {len(df_for_s4)} records for S4 computation.")
+        except MemoryError:
+            print(f"MemoryError: Failed to load all intermediate files for S4 computation for {base_filename}.")
+            print("This indicates the combined size of the processed data (before S4) is too large for your system's RAM.")
+            print("Consider increasing RAM/swap space or moving to a more powerful machine.")
+            return 
 
-            # --- Read + process ---
-            tempdf = readv326(temp_path)
-            tempdf = optimize_dtypes(tempdf)
-            tempdf = add_datetime(tempdf)
-            tempdf = compute_s4(tempdf) # S4 computed for all subsequent operations
+        df_final = compute_s4(df_for_s4)
+        print(f"Computed S4 for all records for '{base_filename}'.")
+        del df_for_s4 
+        gc.collect()
 
-            big_df.append(tempdf)
-            print(f"✅ Appended {len(tempdf)} records")
+        sizes_for_plot = {} 
 
-        except Exception as e:
-            print(f"❌ Failed to process {file}: {e}")
-            import traceback
-            traceback.print_exc()
+        unmasked_file_name = f"{base_filename}_unmasked.parquet"
+        unmasked_file_path = os.path.join(output_folder, unmasked_file_name)
+        df_final.to_parquet(unmasked_file_path, compression='brotli', index=False)
+        sizes_for_plot['unmasked'] = get_file_size_mb(unmasked_file_path)
+        print(f"Saved unmasked processed data: {unmasked_file_path} ({sizes_for_plot['unmasked']:.2f} MB)")
 
-        finally:
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                os.remove(temp_path)
-                print("🧹 Cleaned up temporary file")
+        masked_df = df_final[(df_final['elev'] > 30) & (df_final['s4'] > 0.2)]
+        masked_file_name = f"{base_filename}_masked.parquet"
+        masked_file_path = os.path.join(output_folder, masked_file_name)
+        masked_df.to_parquet(masked_file_path, compression='brotli', index=False)
+        sizes_for_plot['masked'] = get_file_size_mb(masked_file_path)
+        print(f"Saved masked (elev > 30, s4 > 0.2): {masked_file_path} ({sizes_for_plot['masked']:.2f} MB)")
+        del masked_df
+        gc.collect()
 
-    if not big_df:
-        print("❌ No valid data processed.")
+        slim_cols = ['datetime', 'svid', 'cons', 'snr1', 's4']
+        actual_slim_cols = [col for col in slim_cols if col in df_final.columns]
+
+        masked_slim_df = df_final[(df_final['elev'] > 30) & (df_final['s4'] > 0.2)][actual_slim_cols]
+        slim_file_name = f"{base_filename}_masked_slim.parquet"
+        slim_file_path = os.path.join(output_folder, slim_file_name)
+        masked_slim_df.to_parquet(slim_file_path, compression='brotli', index=False)
+        sizes_for_plot['slim'] = get_file_size_mb(slim_file_path)
+        print(f"Saved slimmed (elev > 30, s4 > 0.2, selected cols): {slim_file_path} ({sizes_for_plot['slim']:.2f} MB)")
+        del masked_slim_df
+        gc.collect()
+
+        print(f"Processing for {base_filename}: Elevation-masked, 1-minute downsample...")
+        elev_masked_df = df_final[(df_final['elev'] > 30) & (df_final['elev'] < 90)].copy()
+        elev_masked_df['minbin'] = elev_masked_df['datetime'].dt.floor('min')
+        elev_masked_1min_df = elev_masked_df.groupby(['cons','svid','minbin']).first().reset_index()
+        cols_to_keep_1min = ['datetime', 'minbin', 'svid', 'cons', 'elev', 'azim', 'snr1', 'snr2', 's4']
+        actual_cols_1min = [col for col in cols_to_keep_1min if col in elev_masked_1min_df.columns]
+        elev_masked_1min_df = elev_masked_1min_df[actual_cols_1min]
+        elev_masked_1min_file_name = f"{base_filename}_elev_masked_1min.parquet"
+        elev_masked_1min_file_path = os.path.join(output_folder, elev_masked_1min_file_name)
+        elev_masked_1min_df.to_parquet(elev_masked_1min_file_path, compression='brotli', index=False)
+        sizes_for_plot['elev_masked_1min'] = get_file_size_mb(elev_masked_1min_file_path)
+        print(f"Saved elev-masked (elev > 30, no s4 mask, 1-min downsample): {elev_masked_1min_file_path} ({sizes_for_plot['elev_masked_1min']:.2f} MB)")
+        del elev_masked_df, elev_masked_1min_df
+        gc.collect()
+
+        print(f"Processing for {base_filename}: No mask, 1-second downsample...")
+        no_mask_df = df_final.copy()
+        no_mask_df['secbin'] = no_mask_df['datetime'].dt.floor('s')
+        no_mask_1sec_df = no_mask_df.groupby(['cons','svid','secbin']).first().reset_index()
+        cols_to_keep_1sec = ['datetime', 'secbin', 'svid', 'cons', 'elev', 'azim', 'snr1', 'snr2', 's4']
+        actual_cols_1sec = [col for col in cols_to_keep_1sec if col in no_mask_1sec_df.columns]
+        no_mask_1sec_df = no_mask_1sec_df[actual_cols_1sec]
+        no_mask_1sec_file_name = f"{base_filename}_no_mask_1sec.parquet"
+        no_mask_1sec_file_path = os.path.join(output_folder, no_mask_1sec_file_name)
+        no_mask_1sec_df.to_parquet(no_mask_1sec_file_path, compression='brotli', index=False)
+        sizes_for_plot['no_mask_1sec'] = get_file_size_mb(no_mask_1sec_file_path)
+        print(f"Saved no-mask (1-sec downsample): {no_mask_1sec_file_path} ({sizes_for_plot['no_mask_1sec']:.2f} MB)")
+        del no_mask_df, no_mask_1sec_df
+        gc.collect()
+
+        plot_compression_ratio(
+            sizes_for_plot.get('unmasked', 0),
+            sizes_for_plot.get('masked', 0),
+            sizes_for_plot.get('slim', 0),
+            sizes_for_plot.get('elev_masked_1min', 0),
+            sizes_for_plot.get('no_mask_1sec', 0),
+            filename_prefix=base_filename
+        )
+
+    except Exception as e:
+        print(f"Failed to process {filepath}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    finally:
+
+        if temp_unzipped_path and os.path.exists(temp_unzipped_path):
+            os.remove(temp_unzipped_path)
+            print(f"Cleaned up temporary unzipped file: {temp_unzipped_path}")
+
+        for f_path in intermediate_chunk_files:
+            if os.path.exists(f_path):
+                os.remove(f_path)
+                print(f"Cleaned up intermediate chunk file: {f_path}")
+
+        if 'df_final' in locals():
+            del df_final
+        gc.collect()
+        print(f"Finished processing {os.path.basename(filepath)}. All related memory and temporary files released.")
+
+def process_all_v326_files_in_folder(input_folder, output_folder="processed_v326_output", chunk_size_records=500000):
+    """
+    Reads all .bin.zip files from input_folder, processes them one by one,
+    and saves derived Parquet files into output_folder.
+    """
+    print("Current working directory:", os.getcwd())
+    print("Looking for .bin.zip files in input folder:", input_folder)
+    print("Absolute input path:", os.path.abspath(input_folder))
+
+    if not os.path.exists(output_folder):
+        print(f"Creating output directory: {output_folder}")
+        os.makedirs(output_folder)
+    else:
+        print(f"Output directory already exists: {output_folder}")
+
+    files = glob.glob(os.path.join(input_folder, "*.bin.zip"))
+    if not files:
+        print(f"No .bin.zip files found in the specified input folder: {input_folder}")
+        print("Please ensure the folder path is correct and contains '.bin.zip' files.")
         return
 
-    print("\n🧩 Concatenating all DataFrames...")
-    df = pd.concat(big_df, ignore_index=True)
-    print(f"📊 Total merged record count: {len(df)}")
+    print(f"Found {len(files)} zipped v326 files to process.")
 
-    # Calculate initial unmasked size (before any filtering/sampling)
-    # Convert to PyArrow table first to estimate Parquet size without writing to disk
-    # This is an approximation; actual file size might vary slightly.
+    for i, file_path in enumerate(files):
 
+        process_single_v326_file(file_path, output_folder, chunk_size_records=chunk_size_records)
 
-    # -- Save full unmasked (for baseline comparison, if desired, but not strictly asked to save)
-    # unmasked_file = "v326_unmasked_all.parquet"
-    # df.to_parquet(unmasked_file, compression='brotli', index=False)
-    # unmasked_size = get_file_size_mb(unmasked_file)
-    # print(f"✅ Saved unmasked: {unmasked_file} ({unmasked_size:.2f} MB)")
+    print("\nAll specified files have been processed.")
 
-
-    # -- Mask (original masked file)
-    masked_df = df[(df['elev'] > 30) & (df['s4'] > 0.2)]
-    masked_file = "v326_masked_all.parquet"
-    masked_df.to_parquet(masked_file, compression='brotli', index=False)
-    masked_size = get_file_size_mb(masked_file)
-    print(f"✅ Saved masked (elev > 30, s4 > 0.2): {masked_file} ({masked_size:.2f} MB)")
-
-    # -- Slim (original slimmed file)
-    slim_cols = ['datetime', 'svid', 'cons', 'snr1', 's4']
-    masked_slim_df = masked_df[slim_cols]
-    slim_file = "v326_masked_slim_all.parquet"
-    masked_slim_df.to_parquet(slim_file, compression='brotli', index=False)
-    slim_size = get_file_size_mb(slim_file)
-    print(f"✅ Saved slimmed (elev > 30, s4 > 0.2, selected cols): {slim_file} ({slim_size:.2f} MB)")
-
-    # --- NEW FILE 1: Elevation-masked, no S4 mask, 1-minute downsample ---
-    print("\nProcessing new file: Elevation-masked, 1-minute downsample...")
-    elev_masked_df = df[(df['elev'] > 30) & (df['elev'] < 90)].copy() # Use .copy() to avoid SettingWithCopyWarning
-    elev_masked_df['minbin'] = elev_masked_df['datetime'].dt.floor('min')
-    
-    # Group and take the first record in each minute bin for each constellation/svid
-    elev_masked_1min_df = elev_masked_df.groupby(['cons','svid','minbin']).first().reset_index()
-    # You might want to select specific columns here, otherwise it will save all columns from .first()
-    # For consistency, let's keep it similar to the slimmed approach but with all relevant columns
-    cols_to_keep_1min = ['datetime', 'minbin', 'svid', 'cons', 'elev', 'azim', 'snr1', 'snr2', 's4']
-    elev_masked_1min_df = elev_masked_1min_df[cols_to_keep_1min]
-
-
-    elev_masked_1min_file = "v326_elev_masked_1min.parquet"
-    elev_masked_1min_df.to_parquet(elev_masked_1min_file, compression='brotli', index=False)
-    elev_masked_1min_size = get_file_size_mb(elev_masked_1min_file)
-    print(f"✅ Saved elev-masked (elev > 30, no s4 mask, 1-min downsample): {elev_masked_1min_file} ({elev_masked_1min_size:.2f} MB)")
-
-    # --- NEW FILE 2: No elevation mask, no S4 mask, 1-second downsample ---
-    print("\nProcessing new file: No mask, 1-second downsample...")
-    no_mask_df = df.copy() # Start from the full DataFrame with S4 computed
-    no_mask_df['secbin'] = no_mask_df['datetime'].dt.floor('s')
-
-    # Group and take the first record in each second bin for each constellation/svid
-    no_mask_1sec_df = no_mask_df.groupby(['cons','svid','secbin']).first().reset_index()
-    # Similar to above, select relevant columns
-    cols_to_keep_1sec = ['datetime', 'secbin', 'svid', 'cons', 'elev', 'azim', 'snr1', 'snr2', 's4']
-    no_mask_1sec_df = no_mask_1sec_df[cols_to_keep_1sec]
-
-    no_mask_1sec_file = "v326_no_mask_1sec.parquet"
-    no_mask_1sec_df.to_parquet(no_mask_1sec_file, compression='brotli', index=False)
-    no_mask_1sec_size = get_file_size_mb(no_mask_1sec_file)
-    print(f"✅ Saved no-mask (1-sec downsample): {no_mask_1sec_file} ({no_mask_1sec_size:.2f} MB)")
-
-    # --- Plotting ---
-# --- Run it
 if __name__ == '__main__':
-    # Ensure the 'files/highconfig_s4' directory exists with your .bin.zip files
-    # For testing, you might want to create a dummy directory and put a dummy zip file in it
-    # if you don't have the actual data yet.
-    if not os.path.exists("./files/highconfig_s4"):
-        print("Creating dummy directory for demonstration: ./files/highconfig_s4")
-        os.makedirs("./files/highconfig_s4")
-        # You would typically place your .bin.zip files here.
-        # For a truly runnable example, a dummy zip with a dummy bin file could be created.
-        # However, for this task, we assume the user provides the data.
+    input_directory = "./files/highconfig_s4" 
+    output_directory = "./processed_v326_output" 
 
-    process_all_v326("./files/highconfig_s4")
+    if not os.path.exists(input_directory):
+        print(f"Creating input directory: {input_directory} (Please place your .bin.zip files here)")
+        os.makedirs(input_directory)
+
+    process_all_v326_files_in_folder(input_directory, output_directory, chunk_size_records=500000)
